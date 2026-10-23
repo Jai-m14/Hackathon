@@ -150,6 +150,29 @@ def build_founder_lookup(founders_csv_path: str = None) -> dict[str, list[str]]:
     except Exception as e:
         print(f"[!] Note: Could not parse Founders.csv ({e})")
 
+    # Also index founders from Startups.csv if available
+    for s_path in [
+        "Startups.csv",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
+        os.path.join(os.path.dirname(__file__), "Startups.csv"),
+    ]:
+        if os.path.exists(s_path):
+            try:
+                sdf = pd.read_csv(s_path)
+                s_comp = next((c for c in sdf.columns if "comp" in c.lower()), None)
+                s_fnd = next((c for c in sdf.columns if "found" in c.lower()), None)
+                if s_comp and s_fnd:
+                    for _, row in sdf.iterrows():
+                        c_name = str(row[s_comp]).strip() if pd.notna(row.get(s_comp)) else ""
+                        c_key = c_name.lower()
+                        if c_key and (c_key not in lookup or not lookup[c_key]):
+                            f_list = parse_founders_list(row.get(s_fnd))
+                            if f_list:
+                                lookup[c_key] = f_list
+            except Exception:
+                pass
+            break
+
     return lookup
 
 
@@ -682,6 +705,8 @@ def process_startups_csv(
 def find_default_startups_file() -> str:
     """Finds the most appropriate default input CSV."""
     candidates = [
+        os.path.join(os.path.dirname(__file__), "selected_companies.csv"),
+        "selected_companies.csv",
         "Startups.csv",
         os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
         os.path.join(os.path.dirname(__file__), "Startups.csv"),
@@ -699,7 +724,7 @@ def main():
     )
     parser.add_argument(
         "-i", "--input",
-        help="Input CSV path (defaults to Startups.csv)",
+        help="Input CSV path (defaults to selected_companies.csv or Startups.csv)",
         default=find_default_startups_file(),
     )
     parser.add_argument(

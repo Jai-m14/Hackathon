@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-df = pd.read_csv("global_tech_startups_2026.csv")
+df = pd.read_csv("old_kaggle_csv/global_tech_startups_2026.csv")
 
 # 删除重复公司
 df = df.drop_duplicates(subset="Company_ID")
