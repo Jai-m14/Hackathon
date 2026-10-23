@@ -2,26 +2,24 @@
 """
 analyze_sentiment.py
 --------------------
-Performs comprehensive media and social sentiment analysis on companies provided in a CSV.
+Performs dual-entity sentiment and reputation analysis on startups and their founders
+using live media (Google News RSS), tech community discussions (Hacker News), and
+the UO OpenAI Portal (GPT-6 Astra / Azure OpenAI).
 
-Uses:
-1. Google News RSS: Mainstream media and press coverage
-2. Hacker News (Algolia API): Tech community discussions, comments & points
-3. LLM / GPT Engine (e.g., GPT-6 Astra, GPT-4o, OpenAI-compatible Astra gateways):
-   - Generates exact sentiment scores (-1.0 to 1.0)
-   - Sentiment label (Very Bullish -> Very Bearish)
-   - Executive AI reasoning & investment sentiment summary
-   - Key risks identified from coverage
-   - Key catalysts / positive drivers
-4. Local Fallback: If no API key is provided, seamlessly falls back to NLTK VADER.
+Dual Intelligence:
+1. Company Sentiment: Brand recognition, traction, news coverage, market risks.
+2. Founder Sentiment: Leadership credibility, track record, public perception, executive reputation.
+3. Synthesized Score: Weighted investment sentiment combining both company and founding team.
 
-Configuration:
-- Set your key in .env or environment variable:
-    OPENAI_API_KEY=your_key_here
-    # or
-    ASTRA_API_KEY=your_key_here
-- Or pass via CLI:
-    python analyze_sentiment.py -i companies.csv --api-key YOUR_KEY
+Data Sources:
+- Startups.csv (Kaggle dataset with Company, Categories, Founders, Location, Description)
+- Founders.csv (Kaggle dataset mapping Founder, Company, Gender)
+- Fallback support for any CSV with company and founder columns.
+
+AI Gateway:
+- UO OpenAI Portal: https://app-uoaihack2ix6ak.azurewebsites.net
+- Model: gpt-6-astra (Azure OpenAI gateway)
+- Local Fallback: NLTK VADER with financial and startup domain lexicon.
 """
 
 import argparse
@@ -37,21 +35,15 @@ from datetime import datetime
 import pandas as pd
 import requests
 
-# Load .env file if available
+# Load environment variables
 try:
     from dotenv import load_dotenv
-    # Look for .env in current dir, script dir, and parent dir
+    # Check current directory, script directory, and parent directory
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
     load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+    load_dotenv(os.path.join(os.getcwd(), ".env"))
 except ImportError:
     pass
-
-# Try importing OpenAI client
-try:
-    from openai import OpenAI
-    HAS_OPENAI_LIB = True
-except ImportError:
-    HAS_OPENAI_LIB = False
 
 # Try importing NLTK VADER as guaranteed local fallback
 try:
@@ -63,19 +55,25 @@ try:
         nltk.download("vader_lexicon", quiet=True)
     sia = SentimentIntensityAnalyzer()
     
-    # Financial domain lexicon additions
-    FINANCIAL_LEXICON_UPDATES = {
+    # Financial and founder domain lexicon additions
+    FINANCIAL_FOUNDER_LEXICON = {
         "soars": 2.4, "surges": 2.4, "beats": 2.0, "outperforms": 2.6,
         "breakthrough": 2.5, "profitable": 2.4, "profitability": 2.2,
-        "windfall": 2.2, "tailwind": 1.8, "plummet": -2.6, "plunges": -2.6,
-        "slashes": -2.2, "layoffs": -2.8, "downsizing": -2.0, "lawsuit": -2.2,
-        "antitrust": -2.4, "breach": -2.6, "hack": -2.5, "fraud": -3.2,
-        "headwind": -1.8, "fire sale": -3.0, "bankrupt": -3.2, "bankruptcy": -3.2,
+        "windfall": 2.2, "tailwind": 1.8, "unicorn": 2.5, "visionary": 2.8,
+        "innovative": 2.2, "acclaimed": 2.4, "serial entrepreneur": 2.0,
+        "plummet": -2.6, "plunges": -2.6, "slashes": -2.2, "layoffs": -2.8,
+        "downsizing": -2.0, "lawsuit": -2.5, "fraud": -3.5, "scandal": -3.2,
+        "ousted": -3.0, "resigns": -2.0, "controversy": -2.4, "antitrust": -2.4,
+        "breach": -2.6, "hack": -2.5, "headwind": -1.8, "bankrupt": -3.2,
     }
-    sia.lexicon.update(FINANCIAL_LEXICON_UPDATES)
+    sia.lexicon.update(FINANCIAL_FOUNDER_LEXICON)
 except Exception:
     sia = None
 
+# Configuration Constants
+DEFAULT_UO_ENDPOINT = "https://app-uoaihack2ix6ak.azurewebsites.net"
+DEFAULT_ASTRA_MODEL = "gpt-6-astra"
+DEFAULT_AZURE_API_VERSION = "2024-02-15-preview"
 
 HEADERS = {
     "User-Agent": (
@@ -85,211 +83,356 @@ HEADERS = {
     )
 }
 
+LLM_AUTH_FAILED = False
 
-def clean_company_name_for_query(name: str) -> str:
-    """Cleans legal suffixes and brackets for high-precision search."""
-    clean = re.sub(r"\(.*?\)", "", str(name))
+
+def clean_query_term(term: str) -> str:
+    """Cleans legal suffixes and brackets for clean search query terms."""
+    clean = re.sub(r"\(.*?\)", "", str(term))
     clean = re.sub(
         r"\b(Inc|Corp|LLC|Ltd|Co|Corporation|Technologies|Tech)\b\.?",
         "",
         clean,
         flags=re.IGNORECASE,
     )
-    return clean.strip() or str(name).strip()
+    return clean.strip() or str(term).strip()
 
 
-def fetch_google_news(company_name: str, max_items: int = 15) -> list[dict]:
-    """Fetches recent news articles from Google News RSS."""
-    query = clean_company_name_for_query(company_name)
-    encoded = urllib.parse.quote(f'"{query}"')
-    url = f"https://news.google.com/rss/search?q={encoded}+when:45d&hl=en-US&gl=US&ceid=US:en"
-    articles = []
+def parse_founders_list(founders_val) -> list[str]:
+    """Parses a comma- or semicolon-delimited list of founders into clean individual names."""
+    if not founders_val or pd.isna(founders_val):
+        return []
+    raw = str(founders_val)
+    parts = re.split(r"[,;/|]|\band\b", raw)
+    cleaned = []
+    for p in parts:
+        name = p.strip()
+        if name and len(name) > 1 and name.lower() not in ("none", "n/a", "unknown", "nan"):
+            cleaned.append(name)
+    return cleaned
+
+
+def build_founder_lookup(founders_csv_path: str = None) -> dict[str, list[str]]:
+    """
+    Builds a case-insensitive company -> list of founders mapping from Founders.csv.
+    """
+    candidates = [
+        founders_csv_path,
+        "Founders.csv",
+        os.path.join(os.path.dirname(__file__), "Founders.csv"),
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Founders.csv"),
+    ]
+    target_path = None
+    for c in candidates:
+        if c and os.path.exists(c):
+            target_path = c
+            break
+
+    lookup = {}
+    if not target_path:
+        return lookup
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=12)
-        if resp.status_code == 200:
-            root = ET.fromstring(resp.content)
-            for item in root.findall(".//item")[:max_items]:
-                title = item.findtext("title", default="").strip()
-                pub_date = item.findtext("pubDate", default="").strip()
-                source = item.findtext("source", default="").strip()
-                if title:
-                    articles.append({
-                        "title": title,
-                        "source": source or "News Media",
-                        "pub_date": pub_date,
-                        "type": "media",
-                    })
-    except Exception:
-        pass
+        fdf = pd.read_csv(target_path)
+        # Expect columns: Founder, Company
+        comp_col = next((c for c in fdf.columns if "comp" in c.lower()), "Company")
+        fnd_col = next((c for c in fdf.columns if "found" in c.lower() or "person" in c.lower()), "Founder")
 
-    if not articles:
-        try:
-            url_fallback = f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-            resp = requests.get(url_fallback, headers=HEADERS, timeout=12)
-            if resp.status_code == 200:
-                root = ET.fromstring(resp.content)
-                for item in root.findall(".//item")[:max_items]:
-                    title = item.findtext("title", default="").strip()
-                    if title:
-                        articles.append({
-                            "title": title,
-                            "source": "News Media",
-                            "pub_date": "",
-                            "type": "media",
-                        })
-        except Exception:
-            pass
+        for _, row in fdf.iterrows():
+            comp = str(row[comp_col]).strip() if pd.notna(row.get(comp_col)) else ""
+            fnd = str(row[fnd_col]).strip() if pd.notna(row.get(fnd_col)) else ""
+            if comp and fnd and fnd.lower() not in ("nan", "none"):
+                key = comp.lower()
+                if key not in lookup:
+                    lookup[key] = []
+                if fnd not in lookup[key]:
+                    lookup[key].append(fnd)
+    except Exception as e:
+        print(f"[!] Note: Could not parse Founders.csv ({e})")
+
+    # Also index founders from Startups.csv if available
+    for s_path in [
+        "Startups.csv",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
+        os.path.join(os.path.dirname(__file__), "Startups.csv"),
+    ]:
+        if os.path.exists(s_path):
+            try:
+                sdf = pd.read_csv(s_path)
+                s_comp = next((c for c in sdf.columns if "comp" in c.lower()), None)
+                s_fnd = next((c for c in sdf.columns if "found" in c.lower()), None)
+                if s_comp and s_fnd:
+                    for _, row in sdf.iterrows():
+                        c_name = str(row[s_comp]).strip() if pd.notna(row.get(s_comp)) else ""
+                        c_key = c_name.lower()
+                        if c_key and (c_key not in lookup or not lookup[c_key]):
+                            f_list = parse_founders_list(row.get(s_fnd))
+                            if f_list:
+                                lookup[c_key] = f_list
+            except Exception:
+                pass
+            break
+
+    return lookup
+
+
+def fetch_google_news(query: str, fallback_queries: list[str] = None, max_items: int = 10) -> list[dict]:
+    """Fetches recent news articles from Google News RSS with query fallbacks."""
+    queries_to_try = [query] + (fallback_queries or [])
+    articles = []
+    seen_titles = set()
+
+    for q in queries_to_try:
+        clean_q = clean_query_term(q)
+        encoded = urllib.parse.quote(clean_q)
+        for url in [
+            f"https://news.google.com/rss/search?q={encoded}+when:90d&hl=en-US&gl=US&ceid=US:en",
+            f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en",
+        ]:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=8)
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.content)
+                    for item in root.findall(".//item"):
+                        title = item.findtext("title", default="").strip()
+                        pub_date = item.findtext("pubDate", default="").strip()
+                        source = item.findtext("source", default="").strip()
+                        if title and title not in seen_titles:
+                            seen_titles.add(title)
+                            articles.append({
+                                "title": title,
+                                "source": source or "News Media",
+                                "pub_date": pub_date,
+                                "type": "media",
+                            })
+                            if len(articles) >= max_items:
+                                return articles
+            except Exception:
+                pass
+            if len(articles) >= 2:
+                break
+        if len(articles) >= 2:
+            break
 
     return articles
 
 
-def fetch_hacker_news(company_name: str, max_items: int = 10) -> list[dict]:
-    """Fetches tech and community discussions from Hacker News."""
-    query = clean_company_name_for_query(company_name)
-    url = "https://hn.algolia.com/api/v1/search"
+def fetch_hacker_news(query: str, fallback_queries: list[str] = None, max_items: int = 8) -> list[dict]:
+    """Fetches community tech discussions from Hacker News via the official Algolia API."""
+    queries_to_try = [query] + (fallback_queries or [])
     posts = []
+    seen_titles = set()
 
-    try:
-        params = {"query": query, "tags": "story", "hitsPerPage": max_items}
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=12)
-        if resp.status_code == 200:
-            data = resp.json()
-            for hit in data.get("hits", []):
-                title = hit.get("title") or ""
-                points = hit.get("points") or 0
-                comments = hit.get("num_comments") or 0
-                if title:
-                    posts.append({
-                        "title": title,
-                        "source": f"Hacker News ({points} pts, {comments} cmts)",
-                        "pub_date": hit.get("created_at", "")[:10],
-                        "type": "social",
-                    })
-    except Exception:
-        pass
+    for q in queries_to_try:
+        clean_q = clean_query_term(q)
+        encoded = urllib.parse.quote(clean_q)
+        url = f"https://hn.algolia.com/api/v1/search?query={encoded}&tags=story&hitsPerPage={max_items}"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                for hit in data.get("hits", []):
+                    title = hit.get("title")
+                    points = hit.get("points", 0)
+                    num_comments = hit.get("num_comments", 0)
+                    created_at = hit.get("created_at", "")
+                    if title and title not in seen_titles:
+                        seen_titles.add(title)
+                        posts.append({
+                            "title": title,
+                            "source": f"Hacker News ({points} pts, {num_comments} comments)",
+                            "pub_date": created_at,
+                            "type": "social",
+                        })
+                        if len(posts) >= max_items:
+                            return posts
+        except Exception:
+            pass
+        if len(posts) >= 2:
+            break
 
     return posts
 
 
-def get_llm_sentiment_analysis(
+def parse_llm_json(raw_text: str) -> dict:
+    """Robustly extracts and parses JSON from LLM response text."""
+    clean = re.sub(r"^```(?:json)?", "", raw_text.strip(), flags=re.MULTILINE)
+    clean = re.sub(r"```$", "", clean.strip(), flags=re.MULTILINE).strip()
+    match = re.search(r"\{.*\}", clean, re.DOTALL)
+    if match:
+        clean = match.group(0)
+    return json.loads(clean)
+
+
+def get_llm_dual_sentiment_analysis(
     company_name: str,
-    news_items: list[dict],
-    social_items: list[dict],
-    api_key: str,
+    founders_str: str,
+    company_news: list[dict],
+    company_social: list[dict],
+    founder_news: list[dict],
+    founder_social: list[dict],
+    company_description: str = "",
+    categories: str = "",
+    api_key: str = None,
     base_url: str = None,
-    model: str = "gpt-6-astra",
+    model: str = DEFAULT_ASTRA_MODEL,
 ) -> dict | None:
     """
-    Uses GPT / Astra API to evaluate news and social coverage and return structured JSON sentiment.
+    Evaluates both company and founder sentiment using GPT-6 Astra via the UO OpenAI Portal.
     """
-    if not api_key:
+    global LLM_AUTH_FAILED
+    if not api_key or LLM_AUTH_FAILED:
         return None
 
-    news_text = "\n".join([f"- [News] {item['title']} (Source: {item['source']})" for item in news_items[:12]])
-    social_text = "\n".join([f"- [Social] {item['title']} (Context: {item['source']})" for item in social_items[:8]])
+    # Format company coverage
+    comp_news_txt = "\n".join([f"- [News] {item['title']} (Source: {item['source']})" for item in company_news[:8]])
+    comp_social_txt = "\n".join([f"- [Social] {item['title']} (Context: {item['source']})" for item in company_social[:6]])
+    company_coverage = f"Company Media Coverage:\n{comp_news_txt or 'None found'}\n\nCompany Social Discussions:\n{comp_social_txt or 'None found'}"
 
-    coverage_summary = f"Mainstream Media Coverage:\n{news_text or 'None'}\n\nSocial & Community Discussions:\n{social_text or 'None'}"
+    # Format founder coverage
+    fnd_news_txt = "\n".join([f"- [News] {item['title']} (Source: {item['source']})" for item in founder_news[:8]])
+    fnd_social_txt = "\n".join([f"- [Social] {item['title']} (Context: {item['source']})" for item in founder_social[:6]])
+    founder_coverage = f"Founder Media Coverage:\n{fnd_news_txt or 'None found'}\n\nFounder Social Discussions:\n{fnd_social_txt or 'None found'}"
 
-    prompt = f"""You are an elite quantitative and growth investment analyst.
-Perform an objective media and social sentiment analysis for the company: "{company_name}".
+    context_snippet = ""
+    if company_description:
+        context_snippet += f"\nDescription: {company_description}"
+    if categories:
+        context_snippet += f"\nCategories/Sectors: {categories}"
 
-Analyze the following recent headlines and discussions:
-{coverage_summary}
+    prompt = f"""You are an elite venture capital analyst conducting investment due diligence.
+Perform a thorough dual-entity sentiment analysis on the startup and its founder(s):
+- Company: "{company_name}"{context_snippet}
+- Founder(s): "{founders_str or 'Leadership Team'}"
 
+{company_coverage}
+
+{founder_coverage}
+
+Analyze both the company's business traction/reputation AND the founder(s)' leadership/reputation.
 Respond ONLY with a valid JSON object matching this exact schema:
 {{
-  "overall_sentiment_score": <float between -1.000 and 1.000, where +1.0 is maximum positive, 0.0 is neutral, -1.0 is maximum negative>,
+  "overall_sentiment_score": <float between -1.000 and 1.000, combined weighted score (60% company, 40% founder)>,
   "sentiment_label": <string: "Very Bullish" | "Bullish" | "Neutral" | "Bearish" | "Very Bearish">,
-  "media_sentiment_score": <float between -1.000 and 1.000>,
-  "social_sentiment_score": <float between -1.000 and 1.000>,
-  "positive_pct": <float between 0.0 and 100.0>,
-  "neutral_pct": <float between 0.0 and 100.0>,
-  "negative_pct": <float between 0.0 and 100.0>,
-  "sentiment_reasoning": <concise 1-2 sentence executive explanation of overall sentiment drivers>,
-  "key_risks_identified": <concise summary of major concerns, lawsuits, slowing growth, or negative sentiment seen in coverage>,
-  "key_catalysts_identified": <concise summary of growth catalysts, partnerships, or positive sentiment drivers>,
-  "top_positive_headline": <string or empty>,
-  "top_negative_headline": <string or empty>
+  "company_sentiment_score": <float between -1.000 and 1.000>,
+  "founder_sentiment_score": <float between -1.000 and 1.000>,
+  "founder_reputation_label": <string: "Exceptional / Visionary" | "Positive Track Record" | "Neutral / Early Stage" | "Controversial / High Risk">,
+  "company_summary_reasoning": <concise 1-2 sentence executive explanation of company market traction, news, and brand sentiment>,
+  "founder_summary_reasoning": <concise 1-2 sentence executive explanation of founder reputation, leadership credibility, or controversies>,
+  "key_company_risks": <concise summary of major company/market risks, competition, or slowing growth>,
+  "key_founder_risks": <concise summary of founder/execution risks, leadership changes, or past controversies>,
+  "growth_catalysts": <concise summary of key positive drivers, partnerships, or funding momentum>,
+  "top_company_headline": <string or empty>,
+  "top_founder_headline": <string or empty>
 }}
 """
 
     headers = {
+        "api-key": api_key,
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    
-    endpoint = f"{base_url.rstrip('/')}/chat/completions" if base_url else "https://api.openai.com/v1/chat/completions"
 
-    models_to_try = [model, "gpt-6-astra", "gpt-4o", "gpt-4o-mini"]
-    # De-duplicate while preserving order
+    target_base = (
+        base_url
+        or os.getenv("OPENAI_ENDPOINT")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("ASTRA_BASE_URL")
+        or DEFAULT_UO_ENDPOINT
+    )
+
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION") or DEFAULT_AZURE_API_VERSION
+    is_azure = "azurewebsites.net" in target_base or "openai.azure.com" in target_base
+    models_to_try = [model, DEFAULT_ASTRA_MODEL, "gpt-4o", "gpt-4o-mini"]
     seen = set()
     models_to_try = [m for m in models_to_try if m and not (m in seen or seen.add(m))]
 
     for m in models_to_try:
-        payload = {
-            "model": m,
-            "messages": [
-                {"role": "system", "content": "You are a financial sentiment analysis engine. You output strictly JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.2,
-        }
+        if is_azure:
+            endpoint = f"{target_base.rstrip('/')}/openai/deployments/{m}/chat/completions?api-version={api_version}"
+            payload = {
+                "messages": [
+                    {"role": "system", "content": "You are a venture capital due diligence AI engine. You output strictly JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "max_completion_tokens": 850,
+            }
+        else:
+            endpoint = f"{target_base.rstrip('/')}/chat/completions"
+            payload = {
+                "model": m,
+                "messages": [
+                    {"role": "system", "content": "You are a venture capital due diligence AI engine. You output strictly JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+                "max_completion_tokens": 850,
+            }
 
         try:
             resp = requests.post(endpoint, headers=headers, json=payload, timeout=25)
             if resp.status_code == 200:
                 content = resp.json()["choices"][0]["message"]["content"]
-                parsed = json.loads(content)
-                # Normalize values
+                parsed = parse_llm_json(content)
                 parsed["overall_sentiment_score"] = round(float(parsed.get("overall_sentiment_score", 0.0)), 3)
-                parsed["media_sentiment_score"] = round(float(parsed.get("media_sentiment_score", 0.0)), 3)
-                parsed["social_sentiment_score"] = round(float(parsed.get("social_sentiment_score", 0.0)), 3)
+                parsed["company_sentiment_score"] = round(float(parsed.get("company_sentiment_score", 0.0)), 3)
+                parsed["founder_sentiment_score"] = round(float(parsed.get("founder_sentiment_score", 0.0)), 3)
                 return parsed
+            elif resp.status_code == 401:
+                print("    [!] API key rejected (HTTP 401 Unauthorized).")
+                print("        Seamlessly continuing with high-precision local NLP engine.")
+                LLM_AUTH_FAILED = True
+                return None
             elif resp.status_code in (400, 404):
-                # Try next fallback model
                 continue
             else:
-                print(f"    [!] LLM API returned status {resp.status_code}: {resp.text[:150]}")
+                print(f"    [!] LLM API returned status {resp.status_code}: {resp.text[:120]}")
                 break
         except Exception as e:
-            print(f"    [!] LLM request exception with model {m}: {e}")
+            print(f"    [!] LLM connection note with model {m}: {e}")
             continue
 
     return None
 
 
-def get_vader_fallback_analysis(company_name: str, news_items: list[dict], social_items: list[dict]) -> dict:
-    """Local sentiment analysis fallback using VADER lexicon."""
-    all_items = news_items + social_items
+def get_vader_fallback_dual_analysis(
+    company_name: str,
+    founders_str: str,
+    company_items: list[dict],
+    founder_items: list[dict],
+) -> dict:
+    """Fallback local sentiment scoring using NLTK VADER when offline or no API key."""
+    def score_items(items):
+        if not items or not sia:
+            return 0.0, "", ""
+        scores = []
+        top_pos, top_neg = "", ""
+        best_pos, worst_neg = -1.0, 1.0
+        for item in items:
+            text = item.get("title", "")
+            pol = sia.polarity_scores(text)
+            comp = pol["compound"]
+            scores.append(comp)
+            if comp > best_pos:
+                best_pos = comp
+                top_pos = text
+            if comp < worst_neg:
+                worst_neg = comp
+                top_neg = text
+        avg = sum(scores) / len(scores) if scores else 0.0
+        return avg, top_pos, top_neg
 
-    def score_item(t):
-        return sia.polarity_scores(t)["compound"] if sia and t else 0.0
+    comp_score, top_comp_pos, _ = score_items(company_items)
+    fnd_score, top_fnd_pos, _ = score_items(founder_items)
 
-    news_scores = [score_item(item["title"]) for item in news_items]
-    social_scores = [score_item(item["title"]) for item in social_items]
-    all_scores = news_scores + social_scores
-
-    news_count = len(news_items)
-    social_count = len(social_items)
-    total_count = len(all_items)
-
-    media_score = round(sum(news_scores) / news_count, 3) if news_count > 0 else 0.0
-    social_score = round(sum(social_scores) / social_count, 3) if social_count > 0 else 0.0
-
-    if news_count > 0 and social_count > 0:
-        overall_score = round(0.65 * media_score + 0.35 * social_score, 3)
-    elif news_count > 0:
-        overall_score = media_score
-    elif social_count > 0:
-        overall_score = social_score
+    # Blend: 60% company, 40% founder (or 100% company if no founder items)
+    if founder_items:
+        overall_score = round(0.6 * comp_score + 0.4 * fnd_score, 3)
     else:
-        overall_score = 0.0
+        overall_score = round(comp_score, 3)
 
-    if total_count == 0:
-        label = "Neutral (No Coverage)"
-    elif overall_score >= 0.35:
+    if overall_score >= 0.35:
         label = "Very Bullish"
     elif overall_score >= 0.10:
         label = "Bullish"
@@ -300,155 +443,251 @@ def get_vader_fallback_analysis(company_name: str, news_items: list[dict], socia
     else:
         label = "Neutral"
 
-    pos_items = [s for s in all_scores if s > 0.05]
-    neg_items = [s for s in all_scores if s < -0.05]
-    neu_items = [s for s in all_scores if -0.05 <= s <= 0.05]
-
-    pos_pct = round((len(pos_items) / total_count) * 100, 1) if total_count > 0 else 0.0
-    neg_pct = round((len(neg_items) / total_count) * 100, 1) if total_count > 0 else 0.0
-    neu_pct = round((len(neu_items) / total_count) * 100, 1) if total_count > 0 else 0.0
-
-    top_pos = ""
-    top_neg = ""
-    if all_items:
-        pairs = list(zip(all_items, all_scores))
-        pairs.sort(key=lambda x: x[1], reverse=True)
-        if pairs[0][1] > 0.05:
-            top_pos = pairs[0][0]["title"]
-        if pairs[-1][1] < -0.05:
-            top_neg = pairs[-1][0]["title"]
+    if fnd_score >= 0.30:
+        fnd_label = "Exceptional / Visionary"
+    elif fnd_score >= 0.05:
+        fnd_label = "Positive Track Record"
+    elif fnd_score <= -0.15:
+        fnd_label = "Controversial / High Risk"
+    else:
+        fnd_label = "Neutral / Early Stage"
 
     return {
         "overall_sentiment_score": overall_score,
         "sentiment_label": label,
-        "media_sentiment_score": media_score,
-        "social_sentiment_score": social_score,
-        "positive_pct": pos_pct,
-        "neutral_pct": neu_pct,
-        "negative_pct": neg_pct,
-        "sentiment_reasoning": f"Derived via quantitative NLP analysis across {total_count} articles/posts.",
-        "key_risks_identified": "Identified from negative media spikes." if neg_pct > 25 else "None prominent",
-        "key_catalysts_identified": "Positive momentum indicated in recent press." if pos_pct > 25 else "Standard operations",
-        "top_positive_headline": top_pos,
-        "top_negative_headline": top_neg,
+        "company_sentiment_score": round(comp_score, 3),
+        "founder_sentiment_score": round(fnd_score, 3),
+        "founder_reputation_label": fnd_label,
+        "company_summary_reasoning": f"Local NLP assessed {len(company_items)} company mentions with average sentiment {round(comp_score, 2)}.",
+        "founder_summary_reasoning": f"Local NLP assessed {len(founder_items)} founder mentions for {founders_str or 'Leadership'} with score {round(fnd_score, 2)}.",
+        "key_company_risks": "Standard market risks." if comp_score >= 0 else "Negative sentiment detected in recent media.",
+        "key_founder_risks": "No public leadership controversies identified." if fnd_score >= 0 else "Leadership scrutiny noted in discussions.",
+        "growth_catalysts": "Positive press and community interest." if overall_score > 0 else "Under-the-radar operations.",
+        "top_company_headline": top_comp_pos,
+        "top_founder_headline": top_fnd_pos,
     }
 
 
-def analyze_company(
+def analyze_startup_and_founders(
     company_name: str,
+    founders_list: list[str],
+    company_description: str = "",
+    categories: str = "",
+    city: str = "",
+    country: str = "",
     api_key: str = None,
     base_url: str = None,
-    model: str = "gpt-6-astra",
-    max_news: int = 15,
-    max_social: int = 10,
+    model: str = DEFAULT_ASTRA_MODEL,
+    max_news: int = 10,
+    max_social: int = 8,
 ) -> dict:
-    """Gathers feeds and analyzes sentiment using GPT / Astra with VADER fallback."""
-    news_items = fetch_google_news(company_name, max_items=max_news)
-    social_items = fetch_hacker_news(company_name, max_items=max_social)
-    all_items = news_items + social_items
+    """
+    Gathers coverage and executes dual sentiment analysis for both company and founders.
+    """
+    clean_comp = clean_query_term(company_name)
+    founders_str = ", ".join(founders_list) if founders_list else ""
+
+    # Build company search queries
+    comp_fallbacks = []
+    if categories:
+        primary_cat = str(categories).split(",")[0].strip()
+        comp_fallbacks.append(f"{clean_comp} {primary_cat}")
+    if city or country:
+        loc = f"{city} {country}".strip()
+        comp_fallbacks.append(f"{clean_comp} startup {loc}")
+    comp_fallbacks.append(f"{clean_comp} startup")
+
+    # Fetch company coverage
+    comp_news = fetch_google_news(clean_comp, fallback_queries=comp_fallbacks, max_items=max_news)
+    comp_social = fetch_hacker_news(clean_comp, fallback_queries=comp_fallbacks, max_items=max_social)
+
+    # Build founder search queries
+    fnd_news, fnd_social = [], []
+    if founders_list:
+        # Search for primary founder and founders with company context
+        primary_founder = founders_list[0]
+        fnd_fallbacks = [
+            f"{primary_founder} {clean_comp}",
+            f"{primary_founder} founder",
+            f"{primary_founder} startup",
+        ]
+        fnd_news = fetch_google_news(f'"{primary_founder}"', fallback_queries=fnd_fallbacks, max_items=max_news)
+        fnd_social = fetch_hacker_news(primary_founder, fallback_queries=fnd_fallbacks, max_items=max_social)
 
     # 1. Try GPT / Astra LLM Analysis
     llm_result = None
     if api_key:
-        llm_result = get_llm_sentiment_analysis(
+        llm_result = get_llm_dual_sentiment_analysis(
             company_name=company_name,
-            news_items=news_items,
-            social_items=social_items,
+            founders_str=founders_str,
+            company_news=comp_news,
+            company_social=comp_social,
+            founder_news=fnd_news,
+            founder_social=fnd_social,
+            company_description=company_description,
+            categories=categories,
             api_key=api_key,
             base_url=base_url,
             model=model,
         )
 
-    # 2. If no LLM result, use fallback
     if llm_result:
         res = llm_result
         res["analysis_engine"] = f"GPT / Astra ({model})"
     else:
-        res = get_vader_fallback_analysis(company_name, news_items, social_items)
+        res = get_vader_fallback_dual_analysis(
+            company_name=company_name,
+            founders_str=founders_str,
+            company_items=comp_news + comp_social,
+            founder_items=fnd_news + fnd_social,
+        )
         res["analysis_engine"] = "Local NLP VADER"
 
     # Common metrics
-    res["news_articles_count"] = len(news_items)
-    res["social_posts_count"] = len(social_items)
-    res["total_coverage_count"] = len(all_items)
-    res["sample_headlines"] = " | ".join([item["title"] for item in all_items[:3]])
+    res["founders_analyzed"] = founders_str or "N/A"
+    res["company_news_count"] = len(comp_news)
+    res["company_social_count"] = len(comp_social)
+    res["founder_news_count"] = len(fnd_news)
+    res["founder_social_count"] = len(fnd_social)
+    res["total_coverage_count"] = len(comp_news) + len(comp_social) + len(fnd_news) + len(fnd_social)
+
+    sample_items = [i["title"] for i in (comp_news + fnd_news)[:3]]
+    res["sample_headlines"] = " | ".join(sample_items) if sample_items else "No recent articles found"
 
     return res
 
 
-def find_company_name_column(df: pd.DataFrame) -> str:
-    """Finds best matching company column."""
-    candidates = [
-        "company_name", "company", "name", "Company_Name",
-        "Company", "Name", "ticker", "Ticker", "startup_name",
-        "Startup", "organization"
-    ]
-    for col in candidates:
-        if col in df.columns:
-            return col
-    for col in df.columns:
-        if df[col].dtype == object and col.lower() not in ("id", "company_id", "country", "city", "domain", "sector"):
-            return col
-    return df.columns[0]
+def find_company_and_founder_columns(df: pd.DataFrame) -> tuple[str, str | None]:
+    """Finds the best matching Company and Founders column names."""
+    # Company candidates
+    comp_candidates = ["Company", "company", "Company_Name", "company_name", "Startup", "startup_name", "Name", "name"]
+    comp_col = next((c for c in comp_candidates if c in df.columns), None)
+    if not comp_col:
+        for c in df.columns:
+            if df[c].dtype == object and c.lower() not in ("country", "city", "domain", "sector", "gender"):
+                comp_col = c
+                break
+    comp_col = comp_col or df.columns[0]
+
+    # Founder candidates
+    fnd_candidates = ["Founders", "founders", "Founder", "founder", "Founding_Team", "CEO", "ceo"]
+    fnd_col = next((c for c in fnd_candidates if c in df.columns), None)
+
+    return comp_col, fnd_col
 
 
-def process_csv(
+def process_startups_csv(
     input_csv: str,
+    founders_csv: str = None,
     output_csv: str = None,
     api_key: str = None,
     base_url: str = None,
-    model: str = "gpt-6-astra",
-    max_news: int = 15,
-    max_social: int = 10,
-    delay: float = 0.4,
-):
+    model: str = DEFAULT_ASTRA_MODEL,
+    limit: int = None,
+    max_news: int = 10,
+    max_social: int = 8,
+    delay: float = 0.5,
+) -> str:
+    """
+    Processes startups CSV and runs dual sentiment analysis on company and founders.
+    """
     if not os.path.exists(input_csv):
         raise FileNotFoundError(f"Input CSV not found: {input_csv}")
 
-    # Resolve API Key from argument or environment
+    # Resolve API Key
     resolved_api_key = (
         api_key
         or os.getenv("ASTRA_API_KEY")
         or os.getenv("OPENAI_API_KEY")
         or os.getenv("GPT_API_KEY")
     )
-    resolved_base_url = base_url or os.getenv("ASTRA_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    resolved_base_url = (
+        base_url
+        or os.getenv("OPENAI_ENDPOINT")
+        or os.getenv("OPENAI_BASE_URL")
+        or os.getenv("ASTRA_BASE_URL")
+        or DEFAULT_UO_ENDPOINT
+    )
 
-    print(f"Loading '{input_csv}'...")
+    print(f"\n=======================================================")
+    print(f"  VentureLens Dual Sentiment Engine (Company & Founder)")
+    print(f"=======================================================")
+    print(f"Loading input: '{input_csv}'...")
     df = pd.read_csv(input_csv)
-    company_col = find_company_name_column(df)
-    print(f"Target company column: '{company_col}' ({len(df)} companies)")
+
+    comp_col, fnd_col = find_company_and_founder_columns(df)
+    print(f"Detected Company column: '{comp_col}'")
+    if fnd_col:
+        print(f"Detected Founders column: '{fnd_col}'")
+
+    # Load Founders.csv lookup for cross-referencing
+    founder_lookup = build_founder_lookup(founders_csv)
+    if founder_lookup:
+        print(f"Loaded Founders.csv lookup with {len(founder_lookup)} company-founder mappings.")
+
+    if limit and limit > 0:
+        df = df.head(limit).copy()
+        print(f"Limiting analysis to first {limit} companies.")
 
     if resolved_api_key:
         masked = resolved_api_key[:6] + "..." + resolved_api_key[-4:] if len(resolved_api_key) > 10 else "***"
         print(f"AI Engine: GPT / Astra enabled (Key: {masked}, Model: {model})")
+        print(f"Endpoint:  {resolved_base_url}")
     else:
-        print("AI Engine: No API key detected. Running high-precision local NLP fallback.")
-        print("Tip: Provide your key in .env or via --api-key to enable GPT Astra reasoning.")
+        print("AI Engine: Running high-precision local NLP fallback (NLTK VADER).")
+        print("Tip: Provide your key in .env or via --api-key to enable GPT-6 Astra reasoning.")
 
     results = []
-    print("\n--- Running Sentiment Analysis ---")
+    total = len(df)
+    print(f"\n--- Starting Analysis for {total} Companies & Founders ---")
+
     for idx, row in df.iterrows():
-        name = str(row[company_col]).strip()
-        print(f"[{idx+1}/{len(df)}] Analyzing: {name}...")
-        data = analyze_company(
-            company_name=name,
+        comp_name = str(row[comp_col]).strip() if pd.notna(row.get(comp_col)) else f"Company_{idx}"
+
+        # Determine founders
+        founders = []
+        if fnd_col and pd.notna(row.get(fnd_col)):
+            founders = parse_founders_list(row[fnd_col])
+
+        # Cross-reference with Founders.csv if missing
+        if not founders and comp_name.lower() in founder_lookup:
+            founders = founder_lookup[comp_name.lower()]
+
+        # Metadata context
+        desc = str(row.get("Description", "")) if "Description" in row and pd.notna(row.get("Description")) else ""
+        cats = str(row.get("Categories", "")) if "Categories" in row and pd.notna(row.get("Categories")) else ""
+        city = str(row.get("Headquarters (City)", "")) if "Headquarters (City)" in row and pd.notna(row.get("Headquarters (City)")) else ""
+        country = str(row.get("Headquarters (Country)", "")) if "Headquarters (Country)" in row and pd.notna(row.get("Headquarters (Country)")) else ""
+
+        fnd_display = ", ".join(founders) if founders else "Unknown / Not Listed"
+        print(f"\n[{idx+1}/{total}] Company: '{comp_name}' | Founder(s): '{fnd_display}'")
+
+        data = analyze_startup_and_founders(
+            company_name=comp_name,
+            founders_list=founders,
+            company_description=desc,
+            categories=cats,
+            city=city,
+            country=country,
             api_key=resolved_api_key,
             base_url=resolved_base_url,
             model=model,
             max_news=max_news,
             max_social=max_social,
         )
+
         print(
-            f"       Score: {data['overall_sentiment_score']} ({data['sentiment_label']}) | "
-            f"Engine: {data['analysis_engine']} | "
-            f"Coverage: {data['total_coverage_count']} mentions"
+            f"       Combined: {data['overall_sentiment_score']} ({data['sentiment_label']}) | "
+            f"Company: {data['company_sentiment_score']} | Founder: {data['founder_sentiment_score']} ({data['founder_reputation_label']})"
         )
-        if data.get("sentiment_reasoning"):
-            print(f"       Insight: {data['sentiment_reasoning'][:120]}...")
+        if data.get("company_summary_reasoning"):
+            print(f"       Company Insight: {data['company_summary_reasoning'][:110]}...")
+        if data.get("founder_summary_reasoning"):
+            print(f"       Founder Insight: {data['founder_summary_reasoning'][:110]}...")
+
         results.append(data)
 
-        if delay > 0 and idx < len(df) - 1:
+        if delay > 0 and idx < total - 1:
             time.sleep(delay)
 
     sentiment_df = pd.DataFrame(results)
@@ -459,22 +698,49 @@ def process_csv(
         output_csv = f"{base}_sentiment{ext}"
 
     enriched_df.to_csv(output_csv, index=False)
-    print(f"\n[+] Successfully saved sentiment analysis to:\n    {output_csv}")
+    print(f"\n[+] Successfully saved dual sentiment analysis to:\n    {output_csv}")
     return output_csv
+
+
+def find_default_startups_file() -> str:
+    """Finds the most appropriate default input CSV."""
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "selected_companies.csv"),
+        "selected_companies.csv",
+        "Startups.csv",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
+        os.path.join(os.path.dirname(__file__), "Startups.csv"),
+        "venturelens_portfolio_output.csv",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return "Startups.csv"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run GPT / Astra media and social sentiment analysis on companies in a CSV."
+        description="Run GPT-6 Astra dual sentiment analysis on both startup companies and their founders."
     )
     parser.add_argument(
         "-i", "--input",
-        help="Input CSV path (defaults to selected_companies.csv written by evaluation.py)",
-        default=os.path.join(os.path.dirname(__file__), "selected_companies.csv"),
+        help="Input CSV path (defaults to selected_companies.csv or Startups.csv)",
+        default=find_default_startups_file(),
+    )
+    parser.add_argument(
+        "-f", "--founders-file",
+        help="Path to Founders.csv (for cross-referencing company founders)",
+        default=None,
     )
     parser.add_argument(
         "-o", "--output",
         help="Output CSV path (defaults to <input>_sentiment.csv)",
+        default=None,
+    )
+    parser.add_argument(
+        "-n", "--limit",
+        type=int,
+        help="Limit to first N companies (ideal for testing or demos)",
         default=None,
     )
     parser.add_argument(
@@ -484,25 +750,25 @@ def main():
     )
     parser.add_argument(
         "--base-url",
-        help="Custom API base URL if using an Astra gateway or proxy",
+        help="Custom API base URL (defaults to UO OpenAI Portal endpoint)",
         default=None,
     )
     parser.add_argument(
         "--model",
-        help="Model identifier (default: gpt-6-astra, fallback to gpt-4o)",
-        default="gpt-6-astra",
+        help="Model identifier (default: gpt-6-astra)",
+        default=DEFAULT_ASTRA_MODEL,
     )
     parser.add_argument(
         "--max-news",
         type=int,
-        default=15,
-        help="Max Google News articles per company (default: 15)",
+        default=10,
+        help="Max Google News articles per entity (default: 10)",
     )
     parser.add_argument(
         "--max-social",
         type=int,
-        default=10,
-        help="Max Hacker News posts per company (default: 10)",
+        default=8,
+        help="Max Hacker News posts per entity (default: 8)",
     )
     parser.add_argument(
         "--delay",
@@ -512,12 +778,14 @@ def main():
     )
 
     args = parser.parse_args()
-    process_csv(
+    process_startups_csv(
         input_csv=args.input,
+        founders_csv=args.founders_file,
         output_csv=args.output,
         api_key=args.api_key,
         base_url=args.base_url,
         model=args.model,
+        limit=args.limit,
         max_news=args.max_news,
         max_social=args.max_social,
         delay=args.delay,
