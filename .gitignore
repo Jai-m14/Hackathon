@@ -225,5 +225,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# LLM response cache (llm_matching.py)
+# API response caches (llm_matching.py, finnhub_fetch.py)
 cache/
