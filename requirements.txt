@@ -1,0 +1,21 @@
+# VentureLens / Microsoft Hackathon Dependencies
+
+# Core Data Manipulation & Mathematics
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Network & Web Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# AI, LLM & Sentiment Analysis
+openai>=1.0.0
+python-dotenv>=1.0.0
+nltk>=3.8.0
+
+# Financial Data & Market Indicators
+yfinance>=0.2.30
+
+# Web Dashboard & Interactive Visualizations
+streamlit>=1.30.0
+plotly>=5.18.0
