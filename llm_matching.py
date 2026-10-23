@@ -1,7 +1,7 @@
 """VentureLens: match each selected startup to 3 publicly listed comparables via an LLM.
 
 Run:
-    python llm_matching.py --input venturelens_historical_output.csv --limit 2
+    python llm_matching.py --input venturelens_portfolio_output.csv --limit 2
 
 The LLM only proposes comparable tickers and explains why; it never changes
 scores or weights. Raw responses are cached in cache/llm_matching/ so re-runs
@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -37,36 +38,50 @@ from openai import (
 HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(HERE, ".env"))
 
-DEFAULT_INPUT = "venturelens_historical_output.csv"
+DEFAULT_INPUT = "venturelens_portfolio_output.csv"
 DEFAULT_OUTPUT = "venturelens_matches.csv"
 CACHE_DIR = os.path.join(HERE, "cache", "llm_matching")
 DEFAULT_MODEL = "gpt-4o"
 DEFAULT_AZURE_API_VERSION = "2024-10-21"
 
-# Startup characteristics sent to the LLM (scoring/allocation columns are deliberately excluded).
+# Startup fields sent to the LLM, as (input column, JSON key). Scores, weights, allocation,
+# founders, investor names, logos, addresses and profile URLs are deliberately excluded.
 STARTUP_FIELDS = [
-    "Company_ID", "Domain", "Founding_Year", "Country", "City", "Funding_Stage",
-    "Total_Funding_USD_Millions", "Valuation_USD_Millions", "Revenue_ARR_Millions",
-    "Monthly_Burn_Rate_Millions", "Runway_Months_2024", "Peak_Headcount_2023",
-    "Layoffs_2024_2025", "Current_Headcount_2026", "Investor_Tier",
-    "AI_Adoption_Level", "Acquisition_Status",
+    ("Company_ID", "startup_name"),
+    ("Description", "Description"),
+    ("Categories", "Categories"),
+    ("Domain", "Domain"),
+    ("Funding_Stage", "Funding_Stage"),
+    ("Status", "Status"),
+    ("Year Founded", "Year Founded"),
+    ("Y Combinator Year", "Y Combinator Year"),
+    ("Headquarters (City)", "Headquarters (City)"),
+    ("Headquarters (US State)", "Headquarters (US State)"),
+    ("Headquarters (Country)", "Headquarters (Country)"),
+    ("Website", "Website"),
+    ("Total_Raised_USD_Millions", "Total_Raised_USD_Millions"),
+    ("Investor_Count", "Investor_Count"),
+    ("Tier1_Investor_Count", "Tier1_Investor_Count"),
 ]
-INT_FIELDS = {"Founding_Year", "Peak_Headcount_2023", "Layoffs_2024_2025", "Current_Headcount_2026"}
+INT_FIELDS = {"Year Founded", "Y Combinator Year", "Investor_Count", "Tier1_Investor_Count"}
 
 OUTPUT_COLUMNS = [
     "Company_ID", "Domain", "Country", "Funding_Stage", "rank", "ticker", "company_name",
     "exchange", "similarity_rationale", "key_similarities", "key_differences",
-    "confidence", "model", "generated_at",
+    "confidence", "model", "generated_at", "startup_description",
 ]
 
 SYSTEM_PROMPT = """You are a financial analyst matching private startups to publicly listed comparable companies.
 Given one startup's characteristics as JSON, return the 3 most similar publicly listed companies, most similar first.
 Rules:
-- Match on business domain/sector first, then business model, growth stage and scale (ARR, headcount), AI adoption, and geography.
-- Prefer companies listed on US exchanges (NYSE/NASDAQ), because downstream data coverage is best there. Only pick a non-US listing if no reasonable US-listed comparable exists.
-- Among similarly good matches, prefer companies that have been publicly listed for at least 3 years and file annual reports with the SEC (10-K or 20-F), so financial history is available. Similarity still comes first: do not drop a clearly better match just because of this.
+- Match primarily on WHAT THE COMPANY DOES, from Description and Categories; then business model and customer type (consumer vs business); then stage, scale (total raised) and geography.
+- The Description is the most reliable field. If the name and the Description disagree (e.g. a name that doesn't match the product described), go by the Description.
+- If you recognise the startup, you may use general knowledge of its product to judge similarity, but do not invent financial figures. The rationale must mainly cite the Description and Categories.
+- Never return the startup itself, or a company that acquired it, as a comparable.
+- Confidence must reflect how much of the comparable's CORE business matches the startup. If the match is only one product line or segment of a larger company (e.g. a budgeting app inside a mortgage lender), confidence must be 0.6 or lower, and you should prefer companies whose main business matches (pure-plays).
+- Among similarly good matches, prefer companies listed on US exchanges (NYSE/NASDAQ) for at least 3 years that file annual reports with the SEC (10-K or 20-F). Similarity comes first: do not drop a clearly better match for this.
 - Use only real, currently listed companies with their correct primary ticker. If you are not confident a ticker is correct, lower the confidence; do not invent tickers.
-- Base your reasoning only on the fields provided. Do not invent facts about the startup.
+- similarity_rationale must say in plain words what both companies do, e.g. "Both run search engines for electronic component pricing...".
 Return JSON only, in this exact shape:
 {"matches": [{"rank": 1, "ticker": "XXXX", "company_name": "...", "exchange": "NASDAQ", "similarity_rationale": "1-2 sentences", "key_similarities": ["..."], "key_differences": ["..."], "confidence": 0.0}]}
 confidence is between 0 and 1."""
@@ -78,17 +93,21 @@ TRANSIENT_RETRIES = 5    # attempts on rate-limit / network errors, with exponen
 def startup_payload(row: pd.Series, columns: list[str]) -> dict:
     """Only this startup's characteristics, with NaNs dropped and counts as ints."""
     payload = {}
-    for col in STARTUP_FIELDS:
+    for col, key in STARTUP_FIELDS:
         if col not in columns:
             continue
         value = row[col]
         if value is None or (isinstance(value, float) and math.isnan(value)):
             continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
         if hasattr(value, "item"):  # numpy scalar -> python
             value = value.item()
         if col in INT_FIELDS and isinstance(value, float) and value.is_integer():
             value = int(value)
-        payload[col] = value
+        payload[key] = value
     return payload
 
 
@@ -202,7 +221,9 @@ class Matcher:
 
 
 def cache_path(company_id: str) -> str:
-    return os.path.join(CACHE_DIR, f"{company_id}.json")
+    # Company_ID is a real startup name, so keep the filename filesystem-safe.
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", company_id).strip("._") or "unnamed"
+    return os.path.join(CACHE_DIR, f"{safe}.json")
 
 
 def load_cached(company_id: str) -> dict | None:
@@ -243,7 +264,7 @@ def main() -> None:
     print(f"Columns: {list(df.columns)}")
     if "Company_ID" not in df.columns:
         raise SystemExit("Input has no Company_ID column")
-    missing = [c for c in STARTUP_FIELDS if c not in df.columns]
+    missing = [c for c, _ in STARTUP_FIELDS if c not in df.columns]
     if missing:
         print(f"Note: fields not in input (not sent to LLM): {missing}")
 
@@ -259,7 +280,8 @@ def main() -> None:
     for i, (_, row) in enumerate(df.iterrows(), start=1):
         company_id = row["Company_ID"]
         startup = startup_payload(row, list(df.columns))
-        print(f"[{i}/{len(df)}] {company_id} ({startup.get('Domain', '?')}, {startup.get('Country', '?')})")
+        print(f"[{i}/{len(df)}] {company_id} ({startup.get('Domain', '?')}, "
+              f"{startup.get('Headquarters (Country)', '?')})")
 
         entry = None if args.refresh else load_cached(company_id)
         if entry is not None:
@@ -290,13 +312,14 @@ def main() -> None:
             rows.append({
                 "Company_ID": company_id,
                 "Domain": startup.get("Domain", ""),
-                "Country": startup.get("Country", ""),
+                "Country": startup.get("Headquarters (Country)", ""),
                 "Funding_Stage": startup.get("Funding_Stage", ""),
                 **m,
                 "key_similarities": " | ".join(m["key_similarities"]),
                 "key_differences": " | ".join(m["key_differences"]),
                 "model": entry["model"],
                 "generated_at": entry["generated_at"],
+                "startup_description": startup.get("Description", ""),
             })
             print(f"    {m['rank']}. {m['ticker']:<6} {m['company_name']} ({m['exchange']}) conf={m['confidence']:.2f}")
 
