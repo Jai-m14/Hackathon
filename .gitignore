@@ -1,8 +1,8 @@
 .env
 .env*
 *.env*
-.env.example
-**/.env.example
+# The template has placeholder values only, so it is tracked
+!.env.example
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
