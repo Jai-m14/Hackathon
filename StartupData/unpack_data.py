@@ -5,9 +5,10 @@ import pandas as pd
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HACKATHON_DIR = os.path.dirname(BASE_DIR)
-ZIP_PATH = os.path.join(HACKATHON_DIR, "archive (6).zip")
-RAW_OUTPUT_CSV = os.path.join(BASE_DIR, "global_tech_startups_2026.csv")
-ENRICHED_OUTPUT_CSV = os.path.join(BASE_DIR, "global_tech_startups_with_sectors.csv")
+OLD_DATA_DIR = os.path.join(HACKATHON_DIR, "old_kaggle_csv")
+ZIP_PATH = os.path.join(OLD_DATA_DIR, "archive (6).zip")
+RAW_OUTPUT_CSV = os.path.join(OLD_DATA_DIR, "global_tech_startups_2026.csv")
+ENRICHED_OUTPUT_CSV = os.path.join(OLD_DATA_DIR, "global_tech_startups_with_sectors.csv")
 
 # Sector mapping definitions
 DOMAIN_TO_BROAD_SECTOR = {

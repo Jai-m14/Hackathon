@@ -469,8 +469,8 @@ def main():
     )
     parser.add_argument(
         "-i", "--input",
-        help="Input CSV path (defaults to sample_selected_companies.csv)",
-        default=os.path.join(os.path.dirname(__file__), "sample_selected_companies.csv"),
+        help="Input CSV path (defaults to selected_companies.csv written by evaluation.py)",
+        default=os.path.join(os.path.dirname(__file__), "selected_companies.csv"),
     )
     parser.add_argument(
         "-o", "--output",
