@@ -78,6 +78,7 @@ Rules:
 - The Description is the most reliable field. If the name and the Description disagree (e.g. a name that doesn't match the product described), go by the Description.
 - If you recognise the startup, you may use general knowledge of its product to judge similarity, but do not invent financial figures. The rationale must mainly cite the Description and Categories.
 - Never return the startup itself, or a company that acquired it, as a comparable.
+- Business type must match: do not match a general consumer product to a service limited to one profession or industry.
 - Confidence must reflect how much of the comparable's CORE business matches the startup. If the match is only one product line or segment of a larger company (e.g. a budgeting app inside a mortgage lender), confidence must be 0.6 or lower, and you should prefer companies whose main business matches (pure-plays).
 - Among similarly good matches, prefer companies listed on US exchanges (NYSE/NASDAQ) for at least 3 years that file annual reports with the SEC (10-K or 20-F). Similarity comes first: do not drop a clearly better match for this.
 - Use only real, currently listed companies with their correct primary ticker. If you are not confident a ticker is correct, lower the confidence; do not invent tickers.
@@ -253,6 +254,8 @@ def main() -> None:
     parser.add_argument("--model", default=None, help=f"Model id (default: $LLM_MODEL or {DEFAULT_MODEL})")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N companies")
     parser.add_argument("--refresh", action="store_true", help="Ignore cached responses and call the LLM again")
+    parser.add_argument("--company", action="append", default=None,
+                        help="Only call the LLM for this Company_ID (repeatable); others are read from cache")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -283,7 +286,12 @@ def main() -> None:
         print(f"[{i}/{len(df)}] {company_id} ({startup.get('Domain', '?')}, "
               f"{startup.get('Headquarters (Country)', '?')})")
 
-        entry = None if args.refresh else load_cached(company_id)
+        targeted = args.company is None or company_id in args.company
+        entry = None if (args.refresh and targeted) else load_cached(company_id)
+        if entry is None and not targeted:
+            print("    [x] not cached and not selected by --company; skipped")
+            failures.append(company_id)
+            continue
         if entry is not None:
             print("    cached")
         else:
