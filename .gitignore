@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Finnhub API response cache (regenerate with finnhub_fetch.py)
+cache/
