@@ -32,6 +32,7 @@ MIN_CALL_INTERVAL = 1.1  # seconds; free tier is ~60 calls/min
 MAX_RETRIES = 3
 NEWS_DAYS = 90
 FINANCIAL_YEARS = 5
+MIN_REVENUE_PERIODS = 2  # annual periods with revenue a ticker needs to be "valid"
 
 PROFILE_FIELDS = ["name", "finnhubIndustry", "country", "exchange", "ipo",
                   "marketCapitalization", "weburl"]
@@ -63,7 +64,7 @@ NET_INCOME_CONCEPTS = [
 ]
 
 SUMMARY_COLUMNS = [
-    "Company_ID", "status", "chosen_rank", "ticker", "company_name", "display_name", "industry",
+    "Company_ID", "status", "status_reason", "chosen_rank", "ticker", "company_name", "display_name", "industry",
     "country", "ipo", "market_cap_usd_m", *METRIC_COLUMNS.keys(),
     "llm_confidence", "news_count_90d", "fetched_at",
 ]
@@ -191,11 +192,32 @@ def pick_concept(items, concepts):
     return None, None
 
 
+def reported_cutoff():
+    return f"{date.today().year - FINANCIAL_YEARS - 1}-01-01"
+
+
+def fetch_reported(fetcher, ticker):
+    return fetcher.get(ticker, "financials_reported", "/stock/financials-reported",
+                       {"symbol": ticker, "freq": "annual", "from": reported_cutoff()})
+
+
+def recent_filings(reported):
+    """Annual filings newest first, dropping periods before the cutoff.
+
+    Finnhub's `from` filter is not reliable: FIG returns Fortress Investment
+    Group's 2012-13 filings (a previous holder of the symbol), so filter here.
+    """
+    cutoff = reported_cutoff()
+    filings = [f for f in (reported or {}).get("data") or []
+               if (f.get("endDate") or "")[:10] >= cutoff]
+    return sorted(filings, key=lambda f: f.get("endDate") or "", reverse=True)
+
+
 def extract_annual_financials(reported):
     """Turn Financials As Reported into [{year, revenue, net_income, ...}]."""
     rows = []
     seen_periods = set()
-    for filing in (reported or {}).get("data", []):
+    for filing in recent_filings(reported):
         # Finnhub's "year" is a fiscal label (CRM's FY ending Jan 2026 is 2025 and
         # can collide with the prior filing), so key rows on the period end date.
         end_date = (filing.get("endDate") or "")[:10]
@@ -219,14 +241,18 @@ def extract_annual_financials(reported):
             "revenue_concept": revenue_concept,
             "net_income_concept": ni_concept,
         })
-    rows.sort(key=lambda r: r["end_date"] or "", reverse=True)
     return rows[:FINANCIAL_YEARS]
 
 
-def fetch_comparable(fetcher, ticker):
-    """Fetch every free endpoint for a validated ticker."""
+def fetch_comparable(fetcher, ticker, reported, reported_err):
+    """Fetch the remaining free endpoints for a chosen ticker.
+
+    Financials As Reported was already fetched during validation and is passed in.
+    """
     errors = {}
     today = date.today()
+    if reported_err:
+        errors["financials_reported"] = reported_err
 
     def get(endpoint, path, params):
         data, err = fetcher.get(ticker, endpoint, path, params)
@@ -237,9 +263,6 @@ def fetch_comparable(fetcher, ticker):
 
     peers = get("peers", "/stock/peers", {"symbol": ticker, "grouping": "industry"})
     basic = get("basic_financials", "/stock/metric", {"symbol": ticker, "metric": "all"})
-    reported = get("financials_reported", "/stock/financials-reported",
-                   {"symbol": ticker, "freq": "annual",
-                    "from": f"{today.year - FINANCIAL_YEARS - 1}-01-01"})
     earnings = get("earnings", "/stock/earnings", {"symbol": ticker})
     recs = get("recommendations", "/stock/recommendation", {"symbol": ticker})
     news = get("news", "/company-news",
@@ -248,13 +271,12 @@ def fetch_comparable(fetcher, ticker):
                 "to": today.isoformat()})
 
     basic = basic or {}
-    reported_rows = ((reported or {}).get("data") or [])[:FINANCIAL_YEARS]
     return {
         "peers": [p for p in (peers or []) if p != ticker],
         "metrics": basic.get("metric") or {},
         "metric_series_annual": (basic.get("series") or {}).get("annual") or {},
         "financials_annual": extract_annual_financials(reported),
-        "financials_reported_raw": reported_rows,
+        "financials_reported_raw": recent_filings(reported)[:FINANCIAL_YEARS],
         "earnings": earnings or [],
         "recommendations": recs or [],
         "news": [{k: item.get(k) for k in NEWS_FIELDS} for item in (news or [])],
@@ -263,6 +285,12 @@ def fetch_comparable(fetcher, ticker):
 
 
 def process_company(fetcher, company_id, matches):
+    """Choose the best-ranked valid ticker and fetch its data.
+
+    Valid = non-empty profile2 AND at least MIN_REVENUE_PERIODS annual periods
+    with revenue. If no ticker is valid, fall back to the best-ranked ticker that
+    has a profile, with status ok_partial / status_reason limited_financials.
+    """
     matches = matches.sort_values("rank")
     first = matches.iloc[0]
     result = {
@@ -271,6 +299,7 @@ def process_company(fetcher, company_id, matches):
         "Country": first.get("Country"),
         "Funding_Stage": first.get("Funding_Stage"),
         "status": "no_valid_match",
+        "status_reason": None,
         "chosen_rank": None,
         "ticker": None,
         "display_name": None,
@@ -279,29 +308,54 @@ def process_company(fetcher, company_id, matches):
         "profile": None,
     }
 
+    chosen = None
+    fallback = None  # best-ranked ticker with a profile but too little history
     for _, match in matches.iterrows():
+        rank = int(match["rank"])
         ticker = str(match["ticker"]).strip().upper()
         if not ticker or ticker == "NAN":
-            result["failed_tickers"].append(
-                {"rank": int(match["rank"]), "ticker": None, "reason": "empty ticker"})
+            result["failed_tickers"].append({"rank": rank, "ticker": None, "reason": "empty ticker"})
             continue
 
         profile, err = fetcher.get(ticker, "profile2", "/stock/profile2", {"symbol": ticker})
-        if err:
-            reason = f"profile2 error: {err}"
-        elif not profile:
-            reason = "profile2 returned empty profile (ticker not found)"
-        else:
-            reason = None
-        if reason:
-            print(f"  rank {match['rank']} {ticker}: invalid ({reason})")
-            result["failed_tickers"].append(
-                {"rank": int(match["rank"]), "ticker": ticker, "reason": reason})
+        if err or not profile:
+            reason = (f"profile2 error: {err}" if err
+                      else "profile2 returned empty profile (ticker not found)")
+            print(f"  rank {rank} {ticker}: invalid ({reason})")
+            result["failed_tickers"].append({"rank": rank, "ticker": ticker, "reason": reason})
             continue
 
-        print(f"  rank {match['rank']} {ticker}: valid -> fetching data")
+        reported, reported_err = fetch_reported(fetcher, ticker)
+        candidate = (match, ticker, profile, reported, reported_err)
+        periods = sum(r["revenue"] is not None for r in extract_annual_financials(reported))
+        if periods >= MIN_REVENUE_PERIODS:
+            print(f"  rank {rank} {ticker}: valid ({periods} annual periods with revenue)")
+            chosen = candidate
+            break
+
+        reason = (f"limited_financials: {periods} annual period(s) with revenue, "
+                  f"need {MIN_REVENUE_PERIODS}")
+        if reported_err:
+            reason += f" (financials_reported error: {reported_err})"
+        print(f"  rank {rank} {ticker}: skipped ({reason})")
+        result["failed_tickers"].append({"rank": rank, "ticker": ticker, "reason": reason})
+        if fallback is None:
+            fallback = candidate
+
+    status_reasons = []
+    if chosen is None and fallback is not None:
+        chosen = fallback
+        status_reasons.append("limited_financials")
+        # The fallback ends up used, so it is no longer a skipped ticker
+        result["failed_tickers"] = [f for f in result["failed_tickers"]
+                                    if f["ticker"] != fallback[1]]
+        print(f"  no ticker passed; falling back to {fallback[1]} (limited_financials)")
+
+    if chosen is None:
+        print("  no valid match")
+    else:
+        match, ticker, profile, reported, reported_err = chosen
         result.update({
-            "status": "ok",
             "chosen_rank": int(match["rank"]),
             "ticker": ticker,
             "display_name": display_name(profile.get("name")),
@@ -316,12 +370,11 @@ def process_company(fetcher, company_id, matches):
             },
             "profile": {k: profile.get(k) for k in PROFILE_FIELDS},
         })
-        result.update(fetch_comparable(fetcher, ticker))
+        result.update(fetch_comparable(fetcher, ticker, reported, reported_err))
         if result["fetch_errors"]:
-            result["status"] = "ok_partial"
-        break
-    else:
-        print("  no valid match")
+            status_reasons.append("fetch_errors")
+        result["status"] = "ok_partial" if status_reasons else "ok"
+        result["status_reason"] = "; ".join(status_reasons) or None
 
     result["fetched_at"] = utc_now()
     return result
@@ -333,6 +386,7 @@ def summary_row(r):
     row = {
         "Company_ID": r["Company_ID"],
         "status": r["status"],
+        "status_reason": r.get("status_reason"),
         "chosen_rank": r["chosen_rank"],
         "ticker": r["ticker"],
         "company_name": profile.get("name"),
