@@ -487,6 +487,31 @@ def analyze_startup_and_founders(
     clean_comp = clean_query_term(company_name)
     founders_str = ", ".join(founders_list) if founders_list else ""
 
+    # Instant return for Cash reserve buffer
+    if clean_comp.upper() == "CASH" or "cash reserve" in clean_comp.lower() or "cash" in clean_comp.lower():
+        return {
+            "overall_sentiment_score": 0.0,
+            "sentiment_label": "Neutral (Cash Buffer)",
+            "company_sentiment_score": 0.0,
+            "founder_sentiment_score": 0.0,
+            "founder_reputation_label": "N/A (Cash Buffer)",
+            "company_summary_reasoning": "Cash reserve allocation maintained as liquidity buffer and risk mitigation.",
+            "founder_summary_reasoning": "N/A - Cash reserve allocation.",
+            "key_company_risks": "Inflation and currency purchasing power risk.",
+            "key_founder_risks": "N/A",
+            "growth_catalysts": "Capital preservation and strategic dry powder for market opportunities.",
+            "top_company_headline": "",
+            "top_founder_headline": "",
+            "analysis_engine": "Portfolio Reserve Manager",
+            "founders_analyzed": "N/A",
+            "company_news_count": 0,
+            "company_social_count": 0,
+            "founder_news_count": 0,
+            "founder_social_count": 0,
+            "total_coverage_count": 0,
+            "sample_headlines": "Cash Reserve - Liquidity Buffer",
+        }
+
     # Build company search queries
     comp_fallbacks = []
     if categories:
@@ -560,7 +585,10 @@ def analyze_startup_and_founders(
 def find_company_and_founder_columns(df: pd.DataFrame) -> tuple[str, str | None]:
     """Finds the best matching Company and Founders column names."""
     # Company candidates
-    comp_candidates = ["Company", "company", "Company_Name", "company_name", "Startup", "startup_name", "Name", "name"]
+    comp_candidates = [
+        "Company_ID", "company_id", "Company", "company",
+        "company_name", "Company_Name", "Startup", "startup_name", "Name", "name"
+    ]
     comp_col = next((c for c in comp_candidates if c in df.columns), None)
     if not comp_col:
         for c in df.columns:
@@ -705,17 +733,19 @@ def process_startups_csv(
 def find_default_startups_file() -> str:
     """Finds the most appropriate default input CSV."""
     candidates = [
+        "venturelens_portfolio_output.csv",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "venturelens_portfolio_output.csv"),
+        os.path.join(os.path.dirname(__file__), "venturelens_portfolio_output.csv"),
         os.path.join(os.path.dirname(__file__), "selected_companies.csv"),
         "selected_companies.csv",
         "Startups.csv",
         os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
         os.path.join(os.path.dirname(__file__), "Startups.csv"),
-        "venturelens_portfolio_output.csv",
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
-    return "Startups.csv"
+    return "venturelens_portfolio_output.csv"
 
 
 def main():
@@ -724,7 +754,7 @@ def main():
     )
     parser.add_argument(
         "-i", "--input",
-        help="Input CSV path (defaults to selected_companies.csv or Startups.csv)",
+        help="Input CSV path (defaults to venturelens_portfolio_output.csv)",
         default=find_default_startups_file(),
     )
     parser.add_argument(
