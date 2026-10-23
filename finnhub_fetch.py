@@ -365,6 +365,11 @@ def process_company(fetcher, company_id, matches, startup):
         if not ticker or ticker == "NAN":
             result["failed_tickers"].append({"rank": rank, "ticker": None, "reason": "empty ticker"})
             continue
+        if re.search(r"\s", ticker):  # e.g. Stockholm "TRUE B"; not a Finnhub US symbol
+            print(f"  rank {rank} {ticker}: invalid (unsupported_ticker_format)")
+            result["failed_tickers"].append(
+                {"rank": rank, "ticker": ticker, "reason": "unsupported_ticker_format"})
+            continue
 
         profile, err = fetcher.get(ticker, "profile2", "/stock/profile2", {"symbol": ticker})
         if err or not profile:
