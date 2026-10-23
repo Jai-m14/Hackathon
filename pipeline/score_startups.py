@@ -1,7 +1,11 @@
 """VentureLens: transparent valuation and allocation model for the Y Combinator dataset.
 
-Run:
-    python evaluation.py Startups.csv Founders.csv
+Run (defaults to data/raw/Startups.csv and data/raw/Founders.csv):
+    py pipeline/score_startups.py
+    py pipeline/score_startups.py path/to/Startups.csv path/to/Founders.csv
+
+Writes outputs/venturelens_portfolio_output.csv, outputs/venturelens_scored_companies.csv
+and outputs/selected_companies.csv.
 
 Startups.csv has no ARR, valuation, runway or headcount, so each input of the
 original model is replaced by the closest observable proxy:
@@ -20,11 +24,15 @@ This is an educational screening model, not financial advice.
 """
 from __future__ import annotations
 
-import os
 import re
 import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for paths.py
+import paths  # noqa: E402
 
 CAPITAL_USD = 100_000
 CASH_WEIGHT = 0.10
@@ -249,7 +257,7 @@ def allocate(df: pd.DataFrame, capital: float = CAPITAL_USD) -> pd.DataFrame:
 
 
 def export_for_sentiment(portfolio: pd.DataFrame, path: str) -> None:
-    """Write the selected companies in the schema SentimentAnalysis/analyze_sentiment.py reads."""
+    """Write the selected companies in the schema pipeline/analyze_sentiment.py reads."""
     picks = portfolio[portfolio["Company_ID"].ne("CASH")]
     pd.DataFrame({
         "company_name": picks["Company_ID"],
@@ -268,12 +276,13 @@ def main(startups_path: str, founders_path: str) -> None:
             "Risk_Adjusted_Score", "Scale_Factor", "Weight", "Allocation_USD"]
     print("Top companies by transparent risk-adjusted score:")
     print(portfolio[[c for c in cols if c in portfolio]].to_string(index=False))
-    portfolio.to_csv("venturelens_portfolio_output.csv", index=False)
-    df.to_csv("venturelens_scored_companies.csv", index=False)
-    export_for_sentiment(portfolio, os.path.join("SentimentAnalysis", "selected_companies.csv"))
+    paths.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    portfolio.to_csv(paths.PORTFOLIO_CSV, index=False)
+    df.to_csv(paths.SCORED_CSV, index=False)
+    export_for_sentiment(portfolio, paths.SELECTED_COMPANIES_CSV)
 
 
 if __name__ == "__main__":
     if len(sys.argv) not in (1, 3):
-        raise SystemExit("Usage: python evaluation.py Startups.csv Founders.csv")
-    main(*(sys.argv[1:] or ["Startups.csv", "Founders.csv"]))
+        raise SystemExit("Usage: py pipeline/score_startups.py [Startups.csv Founders.csv]")
+    main(*(sys.argv[1:] or [paths.STARTUPS_CSV, paths.FOUNDERS_CSV]))

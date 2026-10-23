@@ -11,8 +11,8 @@ they fill the column they are placed in.
 
 Usage::
 
-    import json, charts
-    records = json.load(open("venturelens_comparable_data.json", encoding="utf-8"))
+    import json, charts, paths
+    records = json.load(open(paths.COMPARABLE_DATA_JSON, encoding="utf-8"))
     fig = charts.revenue_net_income(records[0], mode="dark")
 
 Functions

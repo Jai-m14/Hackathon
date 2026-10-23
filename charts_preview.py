@@ -1,13 +1,13 @@
 """Preview every VentureLens chart for one startup. Run: streamlit run charts_preview.py"""
 
 import json
-from pathlib import Path
 
 import streamlit as st
 
 import charts
+import paths
 
-DATA = Path(__file__).with_name("venturelens_comparable_data.json")
+DATA = paths.COMPARABLE_DATA_JSON
 
 st.set_page_config(page_title="VentureLens charts preview", layout="wide")
 

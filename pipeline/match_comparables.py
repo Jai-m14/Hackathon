@@ -1,13 +1,13 @@
 """VentureLens: match each selected startup to 3 publicly listed comparables via an LLM.
 
-Run:
-    python llm_matching.py --input venturelens_portfolio_output.csv --limit 2
+Run (defaults to outputs/venturelens_portfolio_output.csv):
+    py pipeline/match_comparables.py --limit 2
 
 The LLM only proposes comparable tickers and explains why; it never changes
 scores or weights. Raw responses are cached in cache/llm_matching/ so re-runs
 (and the live demo) are reproducible and work offline. Use --refresh to ignore it.
 
-Output (fixed contract, long format, 3 rows per startup): venturelens_matches.csv
+Output (fixed contract, long format, 3 rows per startup): outputs/venturelens_matches.csv
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -35,12 +36,14 @@ from openai import (
     RateLimitError,
 )
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(HERE, ".env"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for paths.py
+import paths  # noqa: E402
 
-DEFAULT_INPUT = "venturelens_portfolio_output.csv"
-DEFAULT_OUTPUT = "venturelens_matches.csv"
-CACHE_DIR = os.path.join(HERE, "cache", "llm_matching")
+load_dotenv(paths.ENV_FILE)
+
+DEFAULT_INPUT = str(paths.PORTFOLIO_CSV)
+DEFAULT_OUTPUT = str(paths.MATCHES_CSV)
+CACHE_DIR = str(paths.LLM_CACHE_DIR)
 DEFAULT_MODEL = "gpt-4o"
 DEFAULT_AZURE_API_VERSION = "2024-10-21"
 

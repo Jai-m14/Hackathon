@@ -7,11 +7,11 @@ Startup details from the portfolio output are joined in by Company_ID.
 Every response is cached to cache/finnhub/{TICKER}/{endpoint}.json so the demo
 can run fully offline from the cache.
 
-Usage:
-    py finnhub_fetch.py --input venturelens_matches.csv
-    py finnhub_fetch.py --input sample_matches.csv --limit 2
-    py finnhub_fetch.py --input venturelens_matches.csv --offline   # cache only
-    py finnhub_fetch.py --input venturelens_matches.csv --refresh   # ignore cache
+Usage (defaults to outputs/venturelens_matches.csv):
+    py pipeline/fetch_finnhub.py
+    py pipeline/fetch_finnhub.py --input tests/fixtures/sample_matches.csv --limit 2
+    py pipeline/fetch_finnhub.py --offline   # cache only
+    py pipeline/fetch_finnhub.py --refresh   # ignore cache
 """
 
 import argparse
@@ -27,10 +27,14 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 
-CACHE_DIR = Path("cache/finnhub")
-OUTPUT_JSON = "venturelens_comparable_data.json"
-OUTPUT_CSV = "venturelens_comparables_summary.csv"
-PORTFOLIO_CSV = "venturelens_portfolio_output.csv"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for paths.py
+import paths  # noqa: E402
+
+CACHE_DIR = paths.FINNHUB_CACHE_DIR
+INPUT_CSV = str(paths.MATCHES_CSV)
+OUTPUT_JSON = str(paths.COMPARABLE_DATA_JSON)
+OUTPUT_CSV = str(paths.COMPARABLES_SUMMARY_CSV)
+PORTFOLIO_CSV = str(paths.PORTFOLIO_CSV)
 
 # Portfolio output columns joined into the JSON "startup" object
 PORTFOLIO_TEXT_FIELDS = ["Description", "Categories", "Headquarters (City)",
@@ -96,7 +100,7 @@ class FinnhubFetcher:
         if self._client is None:
             import finnhub  # imported lazily so a fully cached run needs no key
 
-            load_dotenv()
+            load_dotenv(paths.ENV_FILE)
             self._api_key = os.getenv("FINNHUB_KEY")
             if not self._api_key:
                 raise RuntimeError("FINNHUB_KEY is not set in .env")
@@ -476,7 +480,7 @@ def to_json_safe(obj):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", default="venturelens_matches.csv")
+    parser.add_argument("--input", default=INPUT_CSV)
     parser.add_argument("--limit", type=int, help="only process the first N startups")
     parser.add_argument("--refresh", action="store_true", help="ignore the cache")
     parser.add_argument("--offline", action="store_true",

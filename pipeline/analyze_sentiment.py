@@ -12,8 +12,9 @@ Dual Intelligence:
 3. Synthesized Score: Weighted investment sentiment combining both company and founding team.
 
 Data Sources:
-- Startups.csv (Kaggle dataset with Company, Categories, Founders, Location, Description)
-- Founders.csv (Kaggle dataset mapping Founder, Company, Gender)
+- outputs/venturelens_portfolio_output.csv (default input; output: <input>_sentiment.csv)
+- data/raw/Startups.csv (Kaggle dataset with Company, Categories, Founders, Location, Description)
+- data/raw/Founders.csv (Kaggle dataset mapping Founder, Company, Gender)
 - Fallback support for any CSV with company and founder columns.
 
 AI Gateway:
@@ -31,16 +32,19 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for paths.py
+import paths  # noqa: E402
+
 # Load environment variables
 try:
     from dotenv import load_dotenv
-    # Check current directory, script directory, and parent directory
-    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+    # Check the repo root, then the current directory
+    load_dotenv(paths.ENV_FILE)
     load_dotenv(os.path.join(os.getcwd(), ".env"))
 except ImportError:
     pass
@@ -118,9 +122,7 @@ def build_founder_lookup(founders_csv_path: str = None) -> dict[str, list[str]]:
     """
     candidates = [
         founders_csv_path,
-        "Founders.csv",
-        os.path.join(os.path.dirname(__file__), "Founders.csv"),
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Founders.csv"),
+        str(paths.FOUNDERS_CSV),
     ]
     target_path = None
     for c in candidates:
@@ -152,9 +154,7 @@ def build_founder_lookup(founders_csv_path: str = None) -> dict[str, list[str]]:
 
     # Also index founders from Startups.csv if available
     for s_path in [
-        "Startups.csv",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
-        os.path.join(os.path.dirname(__file__), "Startups.csv"),
+        str(paths.STARTUPS_CSV),
     ]:
         if os.path.exists(s_path):
             try:
@@ -733,19 +733,14 @@ def process_startups_csv(
 def find_default_startups_file() -> str:
     """Finds the most appropriate default input CSV."""
     candidates = [
-        "venturelens_portfolio_output.csv",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "venturelens_portfolio_output.csv"),
-        os.path.join(os.path.dirname(__file__), "venturelens_portfolio_output.csv"),
-        os.path.join(os.path.dirname(__file__), "selected_companies.csv"),
-        "selected_companies.csv",
-        "Startups.csv",
-        os.path.join(os.path.dirname(os.path.dirname(__file__)), "Startups.csv"),
-        os.path.join(os.path.dirname(__file__), "Startups.csv"),
+        str(paths.PORTFOLIO_CSV),
+        str(paths.SELECTED_COMPANIES_CSV),
+        str(paths.STARTUPS_CSV),
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
-    return "venturelens_portfolio_output.csv"
+    return str(paths.PORTFOLIO_CSV)
 
 
 def main():
@@ -754,7 +749,7 @@ def main():
     )
     parser.add_argument(
         "-i", "--input",
-        help="Input CSV path (defaults to venturelens_portfolio_output.csv)",
+        help="Input CSV path (defaults to outputs/venturelens_portfolio_output.csv)",
         default=find_default_startups_file(),
     )
     parser.add_argument(
