@@ -46,6 +46,7 @@ data/archive/        old Kaggle data, no longer used; kept for reference
 outputs/             every generated file (test_runs/ holds small trial runs)
 docs/                hackathon plan and Finnhub API notes
 tests/fixtures/      sample inputs for quick runs
+web/                 the VentureLens web app (static site; see web/README.md)
 cache/               API response caches (git-ignored; created on first run)
 ```
 
