@@ -63,7 +63,7 @@ NET_INCOME_CONCEPTS = [
 ]
 
 SUMMARY_COLUMNS = [
-    "Company_ID", "status", "chosen_rank", "ticker", "company_name", "industry",
+    "Company_ID", "status", "chosen_rank", "ticker", "company_name", "display_name", "industry",
     "country", "ipo", "market_cap_usd_m", *METRIC_COLUMNS.keys(),
     "llm_confidence", "news_count_90d", "fetched_at",
 ]
@@ -143,6 +143,13 @@ class FinnhubFetcher:
 
 def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def display_name(name):
+    """Strip trailing bracketed suffixes, e.g. 'Datadog Inc (Pre-Reincorporation)'."""
+    if not name:
+        return None
+    return re.sub(r"(\s*[\(\[][^\(\)\[\]]*[\)\]])+\s*$", "", name).strip() or name
 
 
 def clean_number(value):
@@ -266,6 +273,7 @@ def process_company(fetcher, company_id, matches):
         "status": "no_valid_match",
         "chosen_rank": None,
         "ticker": None,
+        "display_name": None,
         "failed_tickers": [],
         "llm_match": None,
         "profile": None,
@@ -296,6 +304,7 @@ def process_company(fetcher, company_id, matches):
             "status": "ok",
             "chosen_rank": int(match["rank"]),
             "ticker": ticker,
+            "display_name": display_name(profile.get("name")),
             "llm_match": {
                 "company_name": match.get("company_name"),
                 "rationale": match.get("similarity_rationale"),
@@ -327,6 +336,7 @@ def summary_row(r):
         "chosen_rank": r["chosen_rank"],
         "ticker": r["ticker"],
         "company_name": profile.get("name"),
+        "display_name": r.get("display_name"),
         "industry": profile.get("finnhubIndustry"),
         "country": profile.get("country"),
         "ipo": profile.get("ipo"),
