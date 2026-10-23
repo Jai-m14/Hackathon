@@ -1,7 +1,9 @@
 """Fetch Finnhub data for each startup's best valid public comparable.
 
-Reads the LLM-generated matches (3 ranked tickers per Company_ID), picks the
-first ticker that Finnhub recognises, and fetches free-tier Finnhub data for it.
+Reads the LLM-generated matches (3 ranked tickers per Company_ID, where
+Company_ID is the startup's name), picks the best-ranked ticker with a Finnhub
+profile and enough annual financials, and fetches free-tier Finnhub data for it.
+Startup details from the portfolio output are joined in by Company_ID.
 Every response is cached to cache/finnhub/{TICKER}/{endpoint}.json so the demo
 can run fully offline from the cache.
 
@@ -17,6 +19,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +30,13 @@ from dotenv import load_dotenv
 CACHE_DIR = Path("cache/finnhub")
 OUTPUT_JSON = "venturelens_comparable_data.json"
 OUTPUT_CSV = "venturelens_comparables_summary.csv"
+PORTFOLIO_CSV = "venturelens_portfolio_output.csv"
+
+# Portfolio output columns joined into the JSON "startup" object
+PORTFOLIO_TEXT_FIELDS = ["Description", "Categories", "Headquarters (City)",
+                         "Headquarters (Country)", "Website"]
+PORTFOLIO_NUMBER_FIELDS = ["Year Founded", "Total_Raised_USD_Millions",
+                           "Risk_Adjusted_Score", "Weight", "Allocation_USD"]
 
 MIN_CALL_INTERVAL = 1.1  # seconds; free tier is ~60 calls/min
 MAX_RETRIES = 3
@@ -64,7 +74,8 @@ NET_INCOME_CONCEPTS = [
 ]
 
 SUMMARY_COLUMNS = [
-    "Company_ID", "status", "status_reason", "chosen_rank", "ticker", "company_name", "display_name", "industry",
+    "Company_ID", "startup_description", "status", "status_reason", "chosen_rank",
+    "ticker", "company_name", "display_name", "industry",
     "country", "ipo", "market_cap_usd_m", *METRIC_COLUMNS.keys(),
     "llm_confidence", "news_count_90d", "fetched_at",
 ]
@@ -124,7 +135,8 @@ class FinnhubFetcher:
 
     def get(self, ticker, endpoint, path, params):
         """Return (data, error). Uses cache unless --refresh; never raises."""
-        cache_file = CACHE_DIR / ticker / f"{endpoint}.json"
+        # Keep odd tickers (e.g. "RDS/A") from escaping or breaking the cache path
+        cache_file = CACHE_DIR / re.sub(r"[^A-Za-z0-9.\-]", "_", ticker) / f"{endpoint}.json"
         if cache_file.exists() and not self.refresh:
             with open(cache_file, encoding="utf-8") as f:
                 return json.load(f)["data"], None
@@ -151,6 +163,14 @@ def display_name(name):
     if not name:
         return None
     return re.sub(r"(\s*[\(\[][^\(\)\[\]]*[\)\]])+\s*$", "", name).strip() or name
+
+
+def clean_text(value):
+    """Return a stripped string, or None for empty/missing values."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    value = str(value).strip()
+    return value or None
 
 
 def clean_number(value):
@@ -284,7 +304,39 @@ def fetch_comparable(fetcher, ticker, reported, reported_err):
     }
 
 
-def process_company(fetcher, company_id, matches):
+def load_portfolio(path):
+    """Return {Company_ID: {portfolio fields}} from the portfolio output, or {}."""
+    if not Path(path).exists():
+        print(f"Warning: {path} not found; startup portfolio fields will be empty")
+        return {}
+    # Read as text so names like "NA" or "None" are not turned into NaN
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    portfolio = {}
+    for _, row in df.iterrows():
+        fields = {k: clean_text(row.get(k)) for k in PORTFOLIO_TEXT_FIELDS}
+        fields.update({k: clean_number(row.get(k)) for k in PORTFOLIO_NUMBER_FIELDS})
+        if fields["Year Founded"] is not None:
+            fields["Year Founded"] = int(fields["Year Founded"])
+        portfolio[clean_text(row["Company_ID"])] = fields
+    return portfolio
+
+
+def startup_info(company_id, matches, portfolio):
+    first = matches.iloc[0]
+    info = {
+        "Company_ID": company_id,
+        "Domain": clean_text(first.get("Domain")),
+        "Country": clean_text(first.get("Country")),
+        "Funding_Stage": clean_text(first.get("Funding_Stage")),
+        "startup_description": clean_text(first.get("startup_description")),
+        "in_portfolio": company_id in portfolio,
+    }
+    info.update(portfolio.get(company_id)
+                or dict.fromkeys(PORTFOLIO_TEXT_FIELDS + PORTFOLIO_NUMBER_FIELDS))
+    return info
+
+
+def process_company(fetcher, company_id, matches, startup):
     """Choose the best-ranked valid ticker and fetch its data.
 
     Valid = non-empty profile2 AND at least MIN_REVENUE_PERIODS annual periods
@@ -292,12 +344,9 @@ def process_company(fetcher, company_id, matches):
     has a profile, with status ok_partial / status_reason limited_financials.
     """
     matches = matches.sort_values("rank")
-    first = matches.iloc[0]
     result = {
         "Company_ID": company_id,
-        "Domain": first.get("Domain"),
-        "Country": first.get("Country"),
-        "Funding_Stage": first.get("Funding_Stage"),
+        "startup": startup,
         "status": "no_valid_match",
         "status_reason": None,
         "chosen_rank": None,
@@ -360,13 +409,14 @@ def process_company(fetcher, company_id, matches):
             "ticker": ticker,
             "display_name": display_name(profile.get("name")),
             "llm_match": {
-                "company_name": match.get("company_name"),
-                "rationale": match.get("similarity_rationale"),
-                "similarities": match.get("key_similarities"),
-                "differences": match.get("key_differences"),
+                "company_name": clean_text(match.get("company_name")),
+                "exchange": clean_text(match.get("exchange")),
+                "rationale": clean_text(match.get("similarity_rationale")),
+                "similarities": clean_text(match.get("key_similarities")),
+                "differences": clean_text(match.get("key_differences")),
                 "confidence": clean_number(match.get("confidence")),
-                "model": match.get("model"),
-                "generated_at": match.get("generated_at"),
+                "model": clean_text(match.get("model")),
+                "generated_at": clean_text(match.get("generated_at")),
             },
             "profile": {k: profile.get(k) for k in PROFILE_FIELDS},
         })
@@ -385,6 +435,7 @@ def summary_row(r):
     metrics = r.get("metrics") or {}
     row = {
         "Company_ID": r["Company_ID"],
+        "startup_description": r["startup"]["startup_description"],
         "status": r["status"],
         "status_reason": r.get("status_reason"),
         "chosen_rank": r["chosen_rank"],
@@ -425,21 +476,32 @@ def main():
     parser.add_argument("--refresh", action="store_true", help="ignore the cache")
     parser.add_argument("--offline", action="store_true",
                         help="never call the API; use cached responses only")
+    parser.add_argument("--portfolio", default=PORTFOLIO_CSV,
+                        help="portfolio output to join startup details from")
     parser.add_argument("--output-json", default=OUTPUT_JSON)
     parser.add_argument("--output-csv", default=OUTPUT_CSV)
     args = parser.parse_args()
+    # Startup names may contain characters the Windows console cannot print
+    sys.stdout.reconfigure(errors="replace")
 
-    matches = pd.read_csv(args.input)
+    # Company_ID is a free-text startup name: read as text so names like "NA"
+    # are kept, and strip stray whitespace so the portfolio join still matches
+    matches = pd.read_csv(args.input, dtype=str, keep_default_na=False)
+    matches["Company_ID"] = matches["Company_ID"].str.strip()
+    matches["rank"] = pd.to_numeric(matches["rank"], errors="coerce")
+    matches = matches[(matches["Company_ID"] != "") & matches["rank"].notna()]
     company_ids = list(dict.fromkeys(matches["Company_ID"]))  # keep input order
     if args.limit:
         company_ids = company_ids[:args.limit]
 
+    portfolio = load_portfolio(args.portfolio)
     fetcher = FinnhubFetcher(refresh=args.refresh, offline=args.offline)
     results = []
     for i, company_id in enumerate(company_ids, 1):
         print(f"[{i}/{len(company_ids)}] {company_id}")
         group = matches[matches["Company_ID"] == company_id]
-        results.append(process_company(fetcher, company_id, group))
+        startup = startup_info(company_id, group, portfolio)
+        results.append(process_company(fetcher, company_id, group, startup))
 
     with open(args.output_json, "w", encoding="utf-8") as f:
         json.dump(to_json_safe(results), f, indent=2, ensure_ascii=False)
